@@ -1,76 +1,81 @@
-from aiogram import Bot, Dispatcher, executor, types
-from config import BOT_TOKEN
+import logging
+from datetime import datetime, timedelta
+from apscheduler.schedulers.background import BackgroundScheduler
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot)
+# --- Настройка логирования ---
+logging.basicConfig(
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 
-user_data = {}  # Хранит верх, низ, фото
+# --- Дата первого пуша ---
+next_push_date = datetime(2026, 1, 19)  # Можно менять через функцию set_next_push
 
+# --- Функции напоминаний ---
+def remind_prepare_push():
+    logging.info("⚡ Напоминание: Завтра пуш! Не забудь подготовить сообщения 📝")
 
-@dp.message_handler(commands=["start"])
-async def start(msg: types.Message):
-    await msg.answer(
-        "Привет 👋\n\n"
-        "1️⃣ Отправь сообщение с ВЕРХНИМИ Premium эмодзи → ответь /top\n"
-        "2️⃣ Отправь сообщение с НИЖНИМИ Premium эмодзи → ответь /bottom\n"
-        "После этого присылай текст поста и фото, а я пришлю готовый пост"
-    )
+def remind_send_push():
+    logging.info("🚀 Напоминание: Пора отправлять пуш! 🔔")
 
+def remind_weekly_push():
+    logging.info("💰 Еженедельный пуш по тем, кто начал зарабатывать. Проверь рассылку 📊")
 
-@dp.message_handler(commands=["top"])
-async def set_top(msg: types.Message):
-    if msg.reply_to_message:
-        user_data.setdefault(msg.from_user.id, {})["top_id"] = msg.reply_to_message.message_id
-        user_data[msg.from_user.id]["top_chat"] = msg.reply_to_message.chat.id
-        await msg.answer("✅ Верхние эмодзи сохранены")
-    else:
-        await msg.answer("⚠️ Ответь командой /top на сообщение с верхними эмодзи")
+def remind_check_stats():
+    logging.info("📈 Проверка статистики рассылки по неподтвержденным почтам!")
 
+# --- Планирование пушей ---
+scheduler = BackgroundScheduler()
 
-@dp.message_handler(commands=["bottom"])
-async def set_bottom(msg: types.Message):
-    if msg.reply_to_message:
-        user_data.setdefault(msg.from_user.id, {})["bottom_id"] = msg.reply_to_message.message_id
-        user_data[msg.from_user.id]["bottom_chat"] = msg.reply_to_message.chat.id
-        await msg.answer("✅ Нижние эмодзи сохранены")
-    else:
-        await msg.answer("⚠️ Ответь командой /bottom на сообщение с нижними эмодзи")
+def schedule_next_push():
+    global next_push_date
+    scheduler.remove_all_jobs()
 
+    # Подготовка на день раньше
+    prep_times = [
+        (next_push_date - timedelta(days=1)).replace(hour=11, minute=0),
+        (next_push_date - timedelta(days=1)).replace(hour=19, minute=0),
+        (next_push_date - timedelta(days=1)).replace(hour=23, minute=30)
+    ]
+    for t in prep_times:
+        scheduler.add_job(remind_prepare_push, 'date', run_date=t)
 
-@dp.message_handler(content_types=types.ContentType.PHOTO)
-async def save_photo(msg: types.Message):
-    user_data.setdefault(msg.from_user.id, {})["photo"] = msg.photo[-1].file_id
-    await msg.answer("📸 Фото сохранено")
+    # В день пуша
+    send_time = next_push_date.replace(hour=10, minute=0)
+    scheduler.add_job(remind_send_push, 'date', run_date=send_time)
 
+    # Ежедневная проверка статистики
+    scheduler.add_job(remind_check_stats, 'cron', hour=12, minute=0)
 
-@dp.message_handler(commands=["build"])
-async def build_post(msg: types.Message):
-    data = user_data.get(msg.from_user.id, {})
+    # Еженедельный пуш (вторник — подготовка к среде)
+    scheduler.add_job(remind_weekly_push, 'cron', day_of_week='tue', hour=12, minute=0)
 
-    # Проверяем, есть ли верх и низ
-    if not data.get("top_id") or not data.get("bottom_id"):
-        await msg.answer("❗ Сначала нужно задать верх и низ сообщений (/top и /bottom)")
-        return
+    logging.info(f"📅 Следующий пуш назначен на {next_push_date.strftime('%d.%m.%Y')}")
 
-    if not msg.reply_to_message or not msg.reply_to_message.text:
-        await msg.answer("⚠️ Ответь командой /build на сообщение с текстом поста")
-        return
+def set_next_push(year, month, day):
+    """Ручная установка следующей даты пуша"""
+    global next_push_date
+    next_push_date = datetime(year, month, day)
+    schedule_next_push()
+    logging.info(f"✅ Ручная установка следующей даты пуша: {next_push_date.strftime('%d.%m.%Y')}")
 
-    text = msg.reply_to_message.text
-    chat_id = msg.from_user.id
+def auto_increment_push():
+    """После пуша автоматически ставим следующий через 4 дня"""
+    global next_push_date
+    next_push_date += timedelta(days=4)
+    schedule_next_push()
+    logging.info(f"➡️ Следующий пуш автоматически назначен на {next_push_date.strftime('%d.%m.%Y')}")
 
-    # Сначала копируем верхние эмодзи
-    await bot.copy_message(chat_id, data["top_chat"], data["top_id"])
-    # Потом текст + фото
-    if "photo" in data:
-        await bot.send_photo(chat_id, data["photo"], caption=text)
-    else:
-        await bot.send_message(chat_id, text)
-    # Потом копируем нижние эмодзи
-    await bot.copy_message(chat_id, data["bottom_chat"], data["bottom_id"])
+# --- Запуск ---
+schedule_next_push()
+scheduler.start()
+logging.info("Бот-напоминалка запущен! 🚀")
 
-    await msg.answer("✅ Готово! Можешь копировать пост в канал.")
-
-
-if __name__ == "__main__":
-    executor.start_polling(dp)
+# --- Для тестирования: держим скрипт в активном цикле ---
+try:
+    import time
+    while True:
+        time.sleep(60)
+except (KeyboardInterrupt, SystemExit):
+    scheduler.shutdown()
+    logging.info("Бот остановлен.")
