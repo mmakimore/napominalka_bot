@@ -3,7 +3,6 @@ import logging
 import datetime
 import json
 from typing import Optional, Dict, List
-from dateutil.relativedelta import relativedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -53,9 +52,9 @@ class BotData:
                 self.active_chats = data.get('active_chats', [])
                 logger.info(f"Данные загружены: {data}")
         except (FileNotFoundError, json.JSONDecodeError):
-            logger.info("Файл данных не найден, используются значения по умолчанию")
-            # Установите начальную дату по умолчанию
-            self.next_push_date = datetime.date.today()
+            logger.info("Файл данных не найден, устанавливаем дату на завтра")
+            # Устанавливаем первый пуш на завтра
+            self.next_push_date = datetime.date.today() + datetime.timedelta(days=1)
             self.save_data()
     
     def save_data(self):
@@ -75,13 +74,6 @@ class BotData:
             self.active_chats.append(chat_id)
             self.save_data()
             logger.info(f"Добавлен чат: {chat_id}")
-    
-    def remove_chat(self, chat_id: int):
-        """Удалить чат из списка активных"""
-        if chat_id in self.active_chats:
-            self.active_chats.remove(chat_id)
-            self.save_data()
-            logger.info(f"Удален чат: {chat_id}")
 
 bot_data = BotData()
 
@@ -90,26 +82,63 @@ class PushScheduler:
     
     @staticmethod
     def calculate_next_push_date(start_date: datetime.date) -> datetime.date:
-        """Рассчитать следующую дату пуша (каждые 4 дня)"""
+        """Рассчитать следующую дату пуша (каждые 4 дня), НО ТОЛЬКО В БУДУЩЕМ"""
         today = datetime.date.today()
         
-        if start_date > today:
-            return start_date
-        
-        days_passed = (today - start_date).days
-        periods_passed = days_passed // PUSH_INTERVAL_DAYS
-        next_date = start_date + datetime.timedelta(
-            days=(periods_passed + 1) * PUSH_INTERVAL_DAYS
-        )
+        # Если дата в прошлом, вычисляем следующую в будущем
+        if start_date <= today:
+            # Находим разницу в днях
+            days_passed = (today - start_date).days
+            # Находим, сколько полных циклов прошло
+            cycles_passed = days_passed // PUSH_INTERVAL_DAYS
+            # Следующая дата = начальная дата + (циклы + 1) * интервал
+            next_date = start_date + datetime.timedelta(days=(cycles_passed + 1) * PUSH_INTERVAL_DAYS)
+            
+            # Проверяем, что дата в будущем
+            if next_date <= today:
+                next_date += datetime.timedelta(days=PUSH_INTERVAL_DAYS)
+        else:
+            # Если дата в будущем, просто возвращаем ее
+            next_date = start_date
         
         return next_date
     
     @staticmethod
-    def is_push_day(date: datetime.date) -> bool:
-        """Проверить, является ли дата днем пуша"""
+    def calculate_next_push_from_today(start_date: datetime.date) -> datetime.date:
+        """Рассчитать следующую дату пуша, начиная с СЕГОДНЯ"""
+        today = datetime.date.today()
+        
+        # Если стартовая дата в будущем - возвращаем ее
+        if start_date > today:
+            return start_date
+        
+        # Находим, когда будет следующий пуш от стартовой даты
+        days_since_start = (today - start_date).days
+        # Сколько полных циклов прошло
+        cycles = days_since_start // PUSH_INTERVAL_DAYS
+        # Следующий цикл
+        next_date = start_date + datetime.timedelta(days=(cycles + 1) * PUSH_INTERVAL_DAYS)
+        
+        # Убеждаемся, что дата в будущем
+        while next_date <= today:
+            next_date += datetime.timedelta(days=PUSH_INTERVAL_DAYS)
+        
+        return next_date
+    
+    @staticmethod
+    def is_push_today() -> bool:
+        """Проверить, является ли сегодня днем пуша"""
         if not bot_data.next_push_date:
             return False
-        return date == bot_data.next_push_date
+        return bot_data.next_push_date == datetime.date.today()
+    
+    @staticmethod
+    def is_push_tomorrow() -> bool:
+        """Проверить, является ли завтра днем пуша"""
+        if not bot_data.next_push_date:
+            return False
+        tomorrow = datetime.date.today() + datetime.timedelta(days=1)
+        return bot_data.next_push_date == tomorrow
     
     @staticmethod
     def days_until_next_push() -> int:
@@ -123,6 +152,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик команды /start"""
     chat_id = update.effective_chat.id
     bot_data.add_chat(chat_id)
+    
+    # Если дата не установлена или в прошлом - устанавливаем на завтра
+    if not bot_data.next_push_date or bot_data.next_push_date <= datetime.date.today():
+        bot_data.next_push_date = datetime.date.today() + datetime.timedelta(days=1)
+        bot_data.save_data()
     
     keyboard = [
         [
@@ -156,13 +190,33 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     action = query.data
     
     if action == "prepare_push":
-        await send_prepare_reminder(chat_id, context, manual=True)
+        # Проверяем, действительно ли завтра пуш
+        if PushScheduler.is_push_tomorrow():
+            await send_prepare_reminder(chat_id, context, manual=True)
+        else:
+            next_push = bot_data.next_push_date if bot_data.next_push_date else "не установлена"
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"⚠️ Завтра НЕ пуш!\nСледующий пуш: {next_push}"
+            )
+    
     elif action == "send_push":
-        await send_push_day_reminder(chat_id, context, manual=True)
+        # Проверяем, действительно ли сегодня пуш
+        if PushScheduler.is_push_today():
+            await send_push_day_reminder(chat_id, context, manual=True)
+        else:
+            next_push = bot_data.next_push_date if bot_data.next_push_date else "не установлена"
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"⚠️ Сегодня НЕ пуш!\nСледующий пуш: {next_push}"
+            )
+    
     elif action == "stats":
         await send_stats_reminder(chat_id, context, manual=True)
+    
     elif action == "next_push":
         await show_next_push_date(chat_id, context)
+    
     elif action == "set_date":
         await request_new_date(chat_id, context)
     
@@ -185,13 +239,12 @@ async def send_push_day_reminder(chat_id: int, context: ContextTypes.DEFAULT_TYP
     
     await context.bot.send_message(chat_id=chat_id, text=message)
     
-    # Автоматически рассчитываем следующую дату пуша
-    if not manual and bot_data.next_push_date:
-        bot_data.next_push_date = PushScheduler.calculate_next_push_date(
-            bot_data.next_push_date
-        )
-        bot_data.save_data()
-        logger.info(f"Следующая дата пуша: {bot_data.next_push_date}")
+    # После пуша рассчитываем следующую дату
+    if not manual:
+        if bot_data.next_push_date:
+            bot_data.next_push_date = PushScheduler.calculate_next_push_from_today(bot_data.next_push_date)
+            bot_data.save_data()
+            logger.info(f"Новая дата пуша после отправки: {bot_data.next_push_date}")
     
     logger.info(f"Напоминание о пуше отправлено в чат {chat_id}")
 
@@ -213,14 +266,17 @@ async def send_weekly_push_reminder(chat_id: int, context: ContextTypes.DEFAULT_
 async def show_next_push_date(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Показать дату следующего пуша"""
     if not bot_data.next_push_date:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="❌ Дата следующего пуша не установлена.\n"
-                 "Используйте кнопку '🛠 Установить дату'."
-        )
-        return
+        bot_data.next_push_date = datetime.date.today() + datetime.timedelta(days=1)
+        bot_data.save_data()
     
     days_left = PushScheduler.days_until_next_push()
+    
+    if days_left < 0:
+        # Если дата в прошлом, исправляем
+        bot_data.next_push_date = datetime.date.today() + datetime.timedelta(days=1)
+        bot_data.save_data()
+        days_left = 1
+    
     if days_left == 0:
         message = f"🎯 Следующий пуш СЕГОДНЯ! ({bot_data.next_push_date})"
     elif days_left == 1:
@@ -237,7 +293,8 @@ async def request_new_date(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> 
         chat_id=chat_id,
         text="📝 Введите новую дату начала пушей в формате:\n"
              "`ГГГГ-ММ-ДД`\n"
-             "Например: `2024-01-19`",
+             "Например: `2026-01-19`\n\n"
+             "❗ Дата должна быть в БУДУЩЕМ!",
         parse_mode='Markdown'
     )
     context.user_data['waiting_for_date'] = True
@@ -253,6 +310,17 @@ async def handle_date_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     
     try:
         new_date = datetime.datetime.strptime(date_text, "%Y-%m-%d").date()
+        today = datetime.date.today()
+        
+        if new_date <= today:
+            await update.message.reply_text(
+                f"❌ Дата должна быть в БУДУЩЕМ!\n"
+                f"Сегодня: {today}\n"
+                f"Введите дату начиная с завтрашнего дня.",
+                parse_mode='Markdown'
+            )
+            logger.warning(f"Попытка установить прошедшую дату: {new_date} в чате {chat_id}")
+            return
         
         # Устанавливаем новую дату
         bot_data.next_push_date = new_date
@@ -261,9 +329,15 @@ async def handle_date_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         # Перепланируем задания
         await reschedule_jobs(context.application)
         
+        # Рассчитываем следующую дату от новой
+        next_date = PushScheduler.calculate_next_push_from_today(new_date)
+        
         await update.message.reply_text(
             f"✅ Новая дата пуша установлена: `{new_date}`\n"
-            f"Следующий пуш: `{PushScheduler.calculate_next_push_date(new_date)}`",
+            f"Следующий пуш: `{next_date}`\n\n"
+            f"📅 Расписание:\n"
+            f"• Завтра пуш: {next_date == today + datetime.timedelta(days=1)}\n"
+            f"• Сегодня пуш: {new_date == today}",
             parse_mode='Markdown'
         )
         logger.info(f"Новая дата пуша установлена: {new_date} в чате {chat_id}")
@@ -272,7 +346,7 @@ async def handle_date_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text(
             "❌ Неверный формат даты!\n"
             "Используйте: `ГГГГ-ММ-ДД`\n"
-            "Пример: `2024-01-19`",
+            "Пример: `2026-01-19`",
             parse_mode='Markdown'
         )
         logger.warning(f"Неверный формат даты: {date_text} в чате {chat_id}")
@@ -284,22 +358,24 @@ async def schedule_daily_tasks(application: Application) -> None:
     if not bot_data.scheduler:
         bot_data.scheduler = AsyncIOScheduler(timezone=MOSCOW_TZ)
     
-    # Напоминание за день до пуша (11:00, 19:00, 23:30)
+    # Напоминание за день до пуша (11:00, 19:00, 23:30) - только если завтра действительно пуш
     reminders = [(11, 0), (19, 0), (23, 30)]
     for hour, minute in reminders:
         bot_data.scheduler.add_job(
             check_and_send_prepare_reminder,
             CronTrigger(hour=hour, minute=minute, timezone=MOSCOW_TZ),
             args=[application],
-            id=f"prepare_{hour}_{minute}"
+            id=f"prepare_{hour}_{minute}",
+            misfire_grace_time=300
         )
     
-    # Напоминание в день пуша (10:00)
+    # Напоминание в день пуша (10:00) - только если сегодня действительно пуш
     bot_data.scheduler.add_job(
         check_and_send_push_day_reminder,
         CronTrigger(hour=10, minute=0, timezone=MOSCOW_TZ),
         args=[application],
-        id="push_day_10_00"
+        id="push_day_10_00",
+        misfire_grace_time=300
     )
     
     # Ежедневная статистика (12:00)
@@ -307,7 +383,8 @@ async def schedule_daily_tasks(application: Application) -> None:
         send_daily_stats_to_all,
         CronTrigger(hour=12, minute=0, timezone=MOSCOW_TZ),
         args=[application],
-        id="daily_stats_12_00"
+        id="daily_stats_12_00",
+        misfire_grace_time=300
     )
     
     # Еженедельные пуши (вторник 12:00)
@@ -315,7 +392,8 @@ async def schedule_daily_tasks(application: Application) -> None:
         send_weekly_push_to_all,
         CronTrigger(day_of_week="tue", hour=12, minute=0, timezone=MOSCOW_TZ),
         args=[application],
-        id="weekly_push_tue_12_00"
+        id="weekly_push_tue_12_00",
+        misfire_grace_time=300
     )
     
     bot_data.scheduler.start()
@@ -334,16 +412,16 @@ async def check_and_send_prepare_reminder(application: Application) -> None:
         logger.warning("Дата пуша не установлена, пропускаем напоминание")
         return
     
-    today = datetime.date.today()
-    tomorrow = today + datetime.timedelta(days=1)
-    
-    if PushScheduler.is_push_day(tomorrow):
-        logger.info(f"Завтра пуш ({tomorrow}), отправляем напоминания")
+    # Проверяем, действительно ли завтра пуш
+    if PushScheduler.is_push_tomorrow():
+        logger.info(f"Завтра пуш ({bot_data.next_push_date}), отправляем напоминания")
         for chat_id in bot_data.active_chats:
             try:
                 await send_prepare_reminder(chat_id, application.bot)
             except Exception as e:
                 logger.error(f"Ошибка отправки в чат {chat_id}: {e}")
+    else:
+        logger.info(f"Завтра не пуш, пропускаем напоминание. Следующий пуш: {bot_data.next_push_date}")
 
 async def check_and_send_push_day_reminder(application: Application) -> None:
     """Проверить и отправить напоминание в день пуша"""
@@ -351,15 +429,21 @@ async def check_and_send_push_day_reminder(application: Application) -> None:
         logger.warning("Дата пуша не установлена, пропускаем напоминание")
         return
     
-    today = datetime.date.today()
-    
-    if PushScheduler.is_push_day(today):
-        logger.info(f"Сегодня пуш ({today}), отправляем напоминания")
+    # Проверяем, действительно ли сегодня пуш
+    if PushScheduler.is_push_today():
+        logger.info(f"Сегодня пуш ({bot_data.next_push_date}), отправляем напоминания")
         for chat_id in bot_data.active_chats:
             try:
                 await send_push_day_reminder(chat_id, application.bot)
             except Exception as e:
                 logger.error(f"Ошибка отправки в чат {chat_id}: {e}")
+        
+        # После отправки пуша вычисляем следующую дату
+        bot_data.next_push_date = PushScheduler.calculate_next_push_from_today(bot_data.next_push_date)
+        bot_data.save_data()
+        logger.info(f"Следующая дата пуша: {bot_data.next_push_date}")
+    else:
+        logger.info(f"Сегодня не пуш, пропускаем напоминание. Следующий пуш: {bot_data.next_push_date}")
 
 async def send_daily_stats_to_all(application: Application) -> None:
     """Отправить ежедневное напоминание о статистике всем"""
